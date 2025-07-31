@@ -10,7 +10,7 @@ from neo4j import GraphDatabase, Driver
 from neo4j.exceptions import ServiceUnavailable, AuthError
 import json
 import re
-from document_processor import DocumentProcessor
+# from document_processor import DocumentProcessor  # Not needed for hybrid system
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,19 +32,17 @@ class EnhancedKnowledgeGraphManager:
         self.database = database
         self.driver: Optional[Driver] = None
         self.connection_mode = "unknown"
-        self.fallback_data = {
+        self.current_session_data = {
             "nodes": [],
             "relationships": [],
-            "queries": []
+            "queries": [],
+            "active_document": None
         }
+        self.fallback_data = self.current_session_data  # Alias for compatibility
         
-        # Initialize document processor
-        api_key = os.getenv('GEMINI_API_KEY')
-        if api_key:
-            self.doc_processor = DocumentProcessor(api_key)
-        else:
-            logger.warning("GEMINI_API_KEY not found - document processing will be limited")
-            self.doc_processor = None
+        # Document processor not needed in hybrid system
+        # Processing is handled by hybrid_main.py  
+        self.doc_processor = None
         
     def initialize_kg(self) -> bool:
         """
@@ -178,6 +176,10 @@ class EnhancedKnowledgeGraphManager:
         """Store entities in Neo4j database"""
         try:
             with self.driver.session() as session:
+                # Clear all existing data before storing new document
+                logger.info("Clearing existing Neo4j data before storing new document")
+                session.run("MATCH (n) DETACH DELETE n")
+                
                 # Store document node
                 session.run(
                     "MERGE (d:Document {id: $doc_id}) "
@@ -264,10 +266,13 @@ class EnhancedKnowledgeGraphManager:
             return False
     
     def _store_in_fallback(self, doc_result: Dict[str, Any]) -> bool:
-        """Store document in fallback memory storage"""
+        """Store document in fallback memory storage (session-based)"""
         try:
             entities = doc_result.get("entities", {})
             document_id = doc_result.get("document_id")
+            
+            # Clear previous session data before storing new document
+            self.clear_session_data()
             
             # Store as searchable data structure
             doc_data = {
@@ -277,8 +282,9 @@ class EnhancedKnowledgeGraphManager:
                 "processed_at": "now"
             }
             
-            self.fallback_data["nodes"].append(doc_data)
-            logger.info(f"Stored document {document_id} in fallback storage")
+            self.current_session_data["nodes"].append(doc_data)
+            self.current_session_data["active_document"] = document_id
+            logger.info(f"Stored document {document_id} in session storage")
             return True
             
         except Exception as e:
@@ -359,6 +365,94 @@ class EnhancedKnowledgeGraphManager:
         
         return schema_info
     
+    def get_graph_structure(self) -> Dict[str, Any]:
+        """Get the complete graph structure for visualization"""
+        try:
+            if self.connection_mode == "fallback":
+                # Use session data for fallback mode
+                return {
+                    "nodes": self.current_session_data.get("nodes", []),
+                    "edges": self.current_session_data.get("relationships", []),
+                    "stats": {
+                        "total_nodes": len(self.current_session_data.get("nodes", [])),
+                        "total_edges": len(self.current_session_data.get("relationships", [])),
+                        "connection_mode": self.connection_mode
+                    }
+                }
+            
+            # For Neo4j connection, fetch all nodes and relationships
+            nodes = []
+            edges = []
+            
+            # Get all nodes with their properties
+            nodes_query = """
+            MATCH (n)
+            RETURN n.id as id, labels(n)[0] as type, n.name as label, properties(n) as properties
+            LIMIT 1000
+            """
+            
+            try:
+                node_results = self.query_kg(nodes_query)
+                for record in node_results:
+                    node = {
+                        "id": record.get("id", f"node_{len(nodes)}"),
+                        "type": record.get("type", "Unknown"),
+                        "label": record.get("label", record.get("id", "Unnamed")),
+                        "properties": record.get("properties", {})
+                    }
+                    nodes.append(node)
+                    
+                logger.info(f"Fetched {len(nodes)} nodes from Neo4j")
+                
+            except Exception as e:
+                logger.error(f"Error fetching nodes: {e}")
+            
+            # Get all relationships
+            edges_query = """
+            MATCH (a)-[r]->(b)
+            RETURN a.id as source, b.id as target, type(r) as type, properties(r) as properties
+            LIMIT 1000
+            """
+            
+            try:
+                edge_results = self.query_kg(edges_query)
+                for record in edge_results:
+                    edge = {
+                        "source": record.get("source"),
+                        "target": record.get("target"), 
+                        "type": record.get("type", "RELATED_TO"),
+                        "properties": record.get("properties", {})
+                    }
+                    edges.append(edge)
+                    
+                logger.info(f"Fetched {len(edges)} relationships from Neo4j")
+                
+            except Exception as e:
+                logger.error(f"Error fetching relationships: {e}")
+            
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "stats": {
+                    "total_nodes": len(nodes),
+                    "total_edges": len(edges),
+                    "connection_mode": self.connection_mode
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting graph structure: {e}")
+            return {
+                "nodes": [],
+                "edges": [],
+                "stats": {
+                    "total_nodes": 0,
+                    "total_edges": 0,
+                    "connection_mode": self.connection_mode,
+                    "error": str(e)
+                }
+            }
+    
     def process_documents_folder(self, folder_path: str) -> Dict[str, Any]:
         """Process all documents in a folder"""
         if not self.doc_processor:
@@ -378,6 +472,50 @@ class EnhancedKnowledgeGraphManager:
             "stored_documents": stored_count,
             "connection_mode": self.connection_mode,
             "results": results
+        }
+    
+    def clear_session_data(self):
+        """Clear current session data"""
+        logger.info("Clearing session data")
+        self.current_session_data = {
+            "nodes": [],
+            "relationships": [],
+            "queries": [],
+            "active_document": None
+        }
+        self.fallback_data = self.current_session_data
+        
+        # Also clear Neo4j data if connected
+        if self.connection_mode != "fallback" and self.driver:
+            try:
+                with self.driver.session() as session:
+                    # Clear all nodes and relationships
+                    session.run("MATCH (n) DETACH DELETE n")
+                logger.info("Cleared Neo4j database")
+            except Exception as e:
+                logger.error(f"Error clearing Neo4j: {e}")
+    
+    def get_session_stats(self):
+        """Get current session statistics"""
+        # Count actual document nodes only
+        document_nodes = [node for node in self.current_session_data.get("nodes", []) 
+                         if node.get("type") == "Document"]
+        
+        # Also check uploaded files directory
+        from pathlib import Path
+        upload_dir = Path("documents/uploads")
+        uploaded_files = []
+        if upload_dir.exists():
+            uploaded_files = [f.name for f in upload_dir.iterdir() if f.is_file()]
+        
+        return {
+            "documents_in_session": len(document_nodes),
+            "uploaded_files": len(uploaded_files),
+            "uploaded_file_names": uploaded_files,
+            "active_document": self.current_session_data.get("active_document"),
+            "connection_mode": self.connection_mode,
+            "total_nodes": len(self.current_session_data.get("nodes", [])),
+            "total_relationships": len(self.current_session_data.get("relationships", []))
         }
     
     def close(self):

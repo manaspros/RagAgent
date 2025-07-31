@@ -1,0 +1,36 @@
+# Simplified Hybrid RAG System Requirements
+# Install these in order for better compatibility
+
+# Core Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Google Gemini API
+google-generativeai
+
+# Vector Database
+chromadb
+
+# Text Processing and ML
+sentence-transformers
+torch
+transformers
+
+# Environment
+python-dotenv
+
+# HTTP and JSON
+requests
+httpx
+
+# Logging
+loguru
+
+# PDF Processing
+PyPDF2
+pdfplumber
+
+# Optional Neo4j (install separately if needed)
+# neo4j
+# py2neo
