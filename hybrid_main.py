@@ -663,6 +663,13 @@ class HybridRAGProcessor:
                OR toLower(coalesce(n.description, '')) CONTAINS toLower($keyword1)
                OR toLower(coalesce(n.description, '')) CONTAINS toLower($keyword2)
                OR toLower(coalesce(n.description, '')) CONTAINS toLower($keyword3)
+               OR toLower(coalesce(n.definition, '')) CONTAINS toLower($keyword1)
+               OR toLower(coalesce(n.definition, '')) CONTAINS toLower($keyword2)
+               OR toLower(coalesce(n.definition, '')) CONTAINS toLower($keyword3)
+               OR toLower(coalesce(n.term, '')) CONTAINS toLower($keyword1)
+               OR toLower(coalesce(n.term, '')) CONTAINS toLower($keyword2)
+               OR toLower(coalesce(n.term, '')) CONTAINS toLower($keyword3)
+               OR labels(n)[0] IN ['Policy', 'Procedure', 'Term', 'Definition', 'EligibilityCriteria']
             RETURN n.id as id, n.name as name, labels(n)[0] as type, properties(n) as properties
             LIMIT 20
             """
@@ -677,7 +684,11 @@ class HybridRAGProcessor:
                 'surgical': 'surgery', 
                 'knee': 'joint',
                 'covered': 'coverage',
-                'treatment': 'medical'
+                'treatment': 'medical',
+                'anemia': 'blood',
+                'aplastic': 'condition',
+                'disease': 'condition',
+                'illness': 'condition'
             }
             
             # Prioritize important words, then get longer words
@@ -1517,18 +1528,71 @@ async def clear_vector_database():
         if not hybrid_processor.vector_store:
             return {"success": False, "message": "Vector database not available"}
         
-        # Clear ChromaDB collection
+        # Get the ChromaDB collection
         collection = hybrid_processor.vector_store._collection
-        collection.delete()
+        initial_count = collection.count()
+        logger.info(f"Current document count before clearing: {initial_count}")
         
-        # Reinitialize ChromaDB
+        # Force complete clear by removing persistent storage first
+        logger.info("Forcing complete ChromaDB clear by removing persistent storage")
+        import shutil
+        from pathlib import Path
+        
+        try:
+            # Step 1: Close current vector store
+            hybrid_processor.vector_store = None
+            
+            # Step 2: Remove all ChromaDB directories
+            chroma_paths = [
+                Path("data/chroma_db"),
+                Path("data/chroma_db_direct"),
+                Path("chroma_db")  # In case it's in root
+            ]
+            
+            for chroma_dir in chroma_paths:
+                if chroma_dir.exists():
+                    logger.info(f"Removing ChromaDB directory: {chroma_dir}")
+                    shutil.rmtree(chroma_dir)
+                    logger.info(f"Removed {chroma_dir}")
+            
+            logger.info("All ChromaDB directories removed")
+            
+        except Exception as e:
+            logger.error(f"Error removing ChromaDB directories: {e}")
+            
+            # Fallback: try the original deletion methods
+            if initial_count > 0:
+                try:
+                    # Method 1: Delete all documents by getting all IDs
+                    all_docs = collection.get()
+                    if all_docs['ids']:
+                        logger.info(f"Deleting {len(all_docs['ids'])} documents using IDs")
+                        collection.delete(ids=all_docs['ids'])
+                except Exception as e2:
+                    logger.warning(f"ID-based deletion failed: {e2}")
+                
+                try:
+                    # Method 2: Delete with empty where clause (deletes all)
+                    logger.info("Attempting to delete all documents with empty where clause")
+                    collection.delete(where={})
+                except Exception as e2:
+                    logger.warning(f"Where-based deletion failed: {e2}")
+        
+        # Reinitialize ChromaDB to ensure clean state
         hybrid_processor._initialize_chromadb()
+        
+        # Verify final count
+        final_collection = hybrid_processor.vector_store._collection
+        final_count = final_collection.count()
+        logger.info(f"Final document count after reinitialization: {final_count}")
         
         logger.info("✅ Vector database cleared successfully")
         return {
             "success": True,
-            "message": "Vector database cleared successfully",
-            "action": "vector_db_cleared"
+            "message": f"Vector database cleared successfully. Document count: {initial_count} → {final_count}",
+            "action": "vector_db_cleared",
+            "before_count": initial_count,
+            "after_count": final_count
         }
         
     except Exception as e:
