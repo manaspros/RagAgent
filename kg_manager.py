@@ -494,6 +494,12 @@ class EnhancedKnowledgeGraphManager:
                 logger.info("Cleared Neo4j database")
             except Exception as e:
                 logger.error(f"Error clearing Neo4j: {e}")
+                return False
+        return True
+    
+    def clear_session(self):
+        """Alias for clear_session_data for API compatibility"""
+        return self.clear_session_data()
     
     def get_session_stats(self):
         """Get current session statistics"""

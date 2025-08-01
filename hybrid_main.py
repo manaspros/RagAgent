@@ -6,8 +6,10 @@ Integrates hybrid RAG system with existing frontend
 import os
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+from datetime import datetime
 
 # FastAPI imports
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
@@ -22,8 +24,13 @@ import google.generativeai as genai
 # ChromaDB and Vector Store
 import chromadb
 from chromadb.config import Settings
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+try:
+    from langchain_chroma import Chroma
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:
+    # Fallback to old imports if new packages not available
+    from langchain_community.vectorstores import Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Neo4j
@@ -125,6 +132,10 @@ class HybridRAGProcessor:
                 length_function=len
             )
             
+            # Initialize multi-agent system
+            self.agent_system = create_agent_system()
+            logger.info("Multi-agent system initialized")
+            
             self.initialized = True
             logger.info("Hybrid RAG Processor initialized")
             
@@ -133,31 +144,53 @@ class HybridRAGProcessor:
             self.initialized = False
     
     def _initialize_chromadb(self):
-        """Initialize ChromaDB vector database"""
+        """Initialize ChromaDB vector database with robust error handling"""
         try:
             # Create persist directory
             persist_dir = Path("data/chroma_db")
             persist_dir.mkdir(parents=True, exist_ok=True)
             
-            # Initialize embeddings
+            logger.info("Initializing ChromaDB embeddings...")
+            
+            # Initialize embeddings with error handling
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
                 model_kwargs={'device': 'cpu'},
                 encode_kwargs={'normalize_embeddings': True}
             )
             
-            # Initialize ChromaDB
-            self.vector_store = Chroma(
-                persist_directory=str(persist_dir),
-                embedding_function=self.embeddings,
-                collection_name="insurance_documents"
-            )
+            # Test embeddings
+            test_embed = self.embeddings.embed_query("test")
+            logger.info(f"Embeddings initialized successfully (dimension: {len(test_embed)})")
             
-            logger.info("ChromaDB initialized")
+            # Initialize ChromaDB with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.vector_store = Chroma(
+                        persist_directory=str(persist_dir),
+                        embedding_function=self.embeddings,
+                        collection_name="insurance_documents"
+                    )
+                    
+                    # Test the connection with a simple operation
+                    collection = self.vector_store._collection
+                    doc_count = collection.count()
+                    logger.info(f"ChromaDB initialized successfully (existing documents: {doc_count})")
+                    
+                    return True
+                    
+                except Exception as retry_error:
+                    logger.warning(f"ChromaDB initialization attempt {attempt + 1} failed: {retry_error}")
+                    if attempt == max_retries - 1:
+                        raise retry_error
+                    time.sleep(1)  # Wait before retry
             
         except Exception as e:
-            logger.error(f"ChromaDB initialization failed: {e}")
+            logger.error(f"ChromaDB initialization failed after all retries: {e}")
+            logger.error(f"Full error details: {str(e)}")
             self.vector_store = None
+            return False
     
     def _extract_document_content(self, file_path: str) -> str:
         """Extract text content from various document types"""
@@ -185,11 +218,17 @@ class HybridRAGProcessor:
             return ""
     
     def _process_document_with_gemini(self, content: str, document_id: str) -> bool:
-        """Process document content with Gemini and store in KG"""
+        """Process document content with Gemini and store in KG with rate limiting"""
         try:
             if not self.llm:
                 logger.warning("Gemini LLM not available for processing")
                 return False
+            
+            # Add delay to respect rate limits
+            import time
+            time.sleep(2)  # 2 second delay between API calls
+            
+            logger.info("Processing with Gemini (with rate limiting)...")
             
             # Create prompt to extract entities from document
             prompt = f"""
@@ -240,8 +279,67 @@ class HybridRAGProcessor:
                 return False
                 
         except Exception as e:
-            logger.error(f"Error processing document with Gemini: {e}")
+            error_msg = str(e)
+            
+            # Handle specific rate limiting errors
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                logger.warning("Gemini API rate limit exceeded. Using fallback processing.")
+                logger.info("Fallback: Processing document without AI entity extraction")
+                
+                # Store basic document info without Gemini processing
+                try:
+                    # Create a basic document entity with extracted keywords
+                    keywords = self._extract_basic_keywords(content)
+                    
+                    basic_data = {
+                        "entities": {
+                            "documents": [{
+                                "id": document_id, 
+                                "name": document_id, 
+                                "type": "Document",
+                                "keywords": keywords,
+                                "content_length": len(content)
+                            }]
+                        },
+                        "relationships": []
+                    }
+                    
+                    logger.info(f"Fallback processing: Created basic document entity with {len(keywords)} keywords")
+                    return self._store_entities_in_kg(basic_data, document_id, content)
+                except Exception as fallback_error:
+                    logger.error(f"Fallback processing failed: {fallback_error}")
+                    return False
+            else:
+                logger.error(f"Error processing document with Gemini: {e}")
+            
             return False
+    
+    def _extract_basic_keywords(self, content: str) -> list:
+        """Extract basic keywords from document content without AI"""
+        import re
+        
+        # Insurance/medical related keywords to look for
+        important_terms = [
+            'policy', 'insurance', 'coverage', 'premium', 'deductible', 'claim',
+            'surgery', 'treatment', 'medical', 'health', 'procedure', 'hospital',
+            'age', 'eligible', 'benefit', 'amount', 'limit', 'exclusion',
+            'mental', 'illness', 'condition', 'disease', 'therapy', 'diagnosis'
+        ]
+        
+        # Extract words and find matches
+        words = re.findall(r'\b[a-zA-Z]+\b', content.lower())
+        found_keywords = []
+        
+        for term in important_terms:
+            if term in words or any(term in word for word in words):
+                found_keywords.append(term)
+        
+        # Also extract numbers (amounts, ages, etc.)
+        numbers = re.findall(r'\b\d+\b', content)
+        if numbers:
+            found_keywords.extend([f"amount_{num}" for num in numbers[:5]])  # First 5 numbers
+        
+        return found_keywords[:20]  # Limit to 20 keywords
     
     def _store_entities_in_kg(self, extracted_data: dict, document_id: str, content: str) -> bool:
         """Store extracted entities in Knowledge Graph"""
@@ -382,33 +480,62 @@ class HybridRAGProcessor:
             # Process with existing KG manager - create entities directly
             kg_success = self._process_document_with_gemini(content, document_id)
             
-            # Process for vector database
+            # Process for vector database (always attempt, regardless of KG success)
             vdb_chunks = 0
-            if self.vector_store and self.text_splitter:
-                chunks = self.text_splitter.split_text(content)
+            logger.info(f"VDB processing check: vector_store={self.vector_store is not None}, text_splitter={self.text_splitter is not None}")
+            
+            # Always process VDB if available (independent of KG processing)
+            logger.info(f"VDB components check: vector_store type={type(self.vector_store)}, text_splitter type={type(self.text_splitter)}")
+            
+            # Force VDB processing if components exist (regardless of their boolean evaluation)
+            if self.vector_store is not None and self.text_splitter is not None:
+                logger.info("Starting VDB chunk processing...")
+                try:
+                    chunks = self.text_splitter.split_text(content)
+                    logger.info(f"Text split into {len(chunks)} chunks")
                 
-                # Add to ChromaDB with metadata
-                texts = []
-                metadatas = []
+                    # Add to ChromaDB with metadata
+                    texts = []
+                    metadatas = []
+                    
+                    for i, chunk in enumerate(chunks):
+                        texts.append(chunk)
+                        metadatas.append({
+                            "document_id": document_id,
+                            "chunk_index": i,
+                            "total_chunks": len(chunks),
+                            "source": "hybrid_rag",
+                            "file_path": file_path
+                        })
+                    
+                    # Try to add to ChromaDB (this should work without API calls)
+                    logger.info("Attempting to store chunks in ChromaDB...")
+                    
+                    self.vector_store.add_texts(
+                        texts=texts,
+                        metadatas=metadatas,
+                        ids=[f"{document_id}_chunk_{i}" for i in range(len(chunks))]
+                    )
+                    
+                    vdb_chunks = len(chunks)
+                    logger.info(f"✅ Successfully added {vdb_chunks} chunks to ChromaDB")
+                    
+                except Exception as vdb_error:
+                    logger.error(f"VDB processing failed: {vdb_error}")
+                    logger.info(f"Attempted to process chunks, but VDB storage failed")
+                    vdb_chunks = 0
+            else:
+                # VDB not available - log the specific reason
+                if self.vector_store is None:
+                    logger.warning("Vector store is None - VDB processing skipped")
+                elif not self.vector_store:
+                    logger.warning("Vector store exists but evaluates to False - VDB processing skipped")
+                    logger.warning(f"Vector store state: {getattr(self.vector_store, '_collection', 'no _collection attr')}")
                 
-                for i, chunk in enumerate(chunks):
-                    texts.append(chunk)
-                    metadatas.append({
-                        "document_id": document_id,
-                        "chunk_index": i,
-                        "total_chunks": len(chunks),
-                        "source": "hybrid_rag",
-                        "file_path": file_path
-                    })
-                
-                self.vector_store.add_texts(
-                    texts=texts,
-                    metadatas=metadatas,
-                    ids=[f"{document_id}_chunk_{i}" for i in range(len(chunks))]
-                )
-                
-                vdb_chunks = len(chunks)
-                logger.info(f"Added {vdb_chunks} chunks to ChromaDB")
+                if self.text_splitter is None:
+                    logger.warning("Text splitter is None - VDB processing skipped")
+                elif not self.text_splitter:
+                    logger.warning("Text splitter exists but evaluates to False - VDB processing skipped")
             
             logger.info(f"Document processed: KG={kg_success}, VDB={vdb_chunks} chunks")
             
@@ -464,9 +591,9 @@ class HybridRAGProcessor:
                     logger.error(f"KG retrieval failed: {e}")
                     # Continue with empty KG facts rather than failing completely
             
-            # Step 3: Enhanced reasoning with explicit citations
+            # Step 3: Enhanced reasoning with explicit citations using multi-agent system
             try:
-                return self._process_with_citations(query, vdb_results, kg_facts)
+                return self._process_with_agents_and_citations(query, vdb_results, kg_facts)
             except Exception as e:
                 logger.error(f"Citation processing failed: {e}")
                 # Fall back to simple processing
@@ -524,12 +651,30 @@ class HybridRAGProcessor:
                OR toLower(n.id) CONTAINS toLower($keyword1)
                OR toLower(n.id) CONTAINS toLower($keyword2)
                OR toLower(n.id) CONTAINS toLower($keyword3)
+               OR any(key in keys(n) WHERE toLower(toString(n[key])) CONTAINS toLower($keyword1))
+               OR any(key in keys(n) WHERE toLower(toString(n[key])) CONTAINS toLower($keyword2))
+               OR any(key in keys(n) WHERE toLower(toString(n[key])) CONTAINS toLower($keyword3))
             RETURN n.id as id, n.name as name, labels(n)[0] as type, properties(n) as properties
-            LIMIT 15
+            LIMIT 20
             """
             
-            query_keywords = [word for word in query.lower().split() if len(word) > 2][:3]  # Filter short words
-            logger.info(f"Using keywords: {query_keywords}")
+            # Better keyword extraction - include important medical/insurance terms
+            important_words = ['mental', 'illness', 'disease', 'condition', 'surgery', 'treatment', 'insurance', 'policy', 'coverage', 'age', 'year', 'eligible', 'premium']
+            query_words = query.lower().split()
+            
+            # Prioritize important words, then get longer words
+            query_keywords = []
+            for word in query_words:
+                if word in important_words:
+                    query_keywords.append(word)
+            
+            # Add other words longer than 2 characters
+            for word in query_words:
+                if len(word) > 2 and word not in query_keywords:
+                    query_keywords.append(word)
+            
+            query_keywords = query_keywords[:3]  # Take top 3
+            logger.info(f"Using enhanced keywords: {query_keywords}")
             
             try:
                 with self.kg_manager.driver.session() as session:
@@ -733,6 +878,97 @@ class HybridRAGProcessor:
         except Exception as e:
             logger.error(f"Citation processing failed: {e}")
             return self._fallback_query_processing_simple(query, vdb_results)
+    
+    def _process_with_agents_and_citations(self, query: str, vdb_results: List[Dict], kg_facts: List[Dict]) -> QueryResponse:
+        """Process query using multi-agent system with comprehensive citations"""
+        try:
+            logger.info("Processing query with multi-agent system and citations")
+            
+            # Prepare context data for agents
+            context_data = []
+            
+            # Add VDB results to context
+            for vdb_result in vdb_results:
+                context_data.append({
+                    "type": "document_chunk",
+                    "content": vdb_result.get("content", ""),
+                    "metadata": vdb_result.get("metadata", {}),
+                    "source": "VDB"
+                })
+            
+            # Add KG facts to context  
+            for kg_fact in kg_facts:
+                context_data.append({
+                    "type": "knowledge_fact",
+                    "content": f"{kg_fact.get('name', 'Unknown')} ({kg_fact.get('node_type', 'Entity')})",
+                    "properties": kg_fact.get("properties", {}),
+                    "source": "KG"
+                })
+            
+            # Use multi-agent system to process the query
+            agent_result = self.agent_system.process_query(query, context_data)
+            
+            logger.info(f"Agent processing result: {agent_result.get('decision', 'N/A')}")
+            
+            # Build citation map for explicit source tracking
+            citation_map = {}
+            citation_counter = 1
+            relevant_clauses = []
+            
+            # Add VDB citations
+            for i, vdb_result in enumerate(vdb_results[:5]):
+                citation_id = f"VDB{citation_counter}"
+                citation_map[citation_id] = vdb_result
+                
+                relevant_clauses.append({
+                    "clause_text": vdb_result.get("content", "")[:200] + "...",
+                    "document_id": vdb_result.get("metadata", {}).get("document_id", "unknown"),
+                    "page_section": vdb_result.get("metadata", {}).get("chunk_index", "chunk"),
+                    "retrieval_source": f"Vector Database (VDB) - Chunk {i+1}"
+                })
+                citation_counter += 1
+            
+            # Add KG citations
+            for i, kg_fact in enumerate(kg_facts[:5]):
+                citation_id = f"KG{citation_counter}"
+                citation_map[citation_id] = kg_fact
+                
+                relevant_clauses.append({
+                    "clause_text": f"Entity: {kg_fact.get('name', 'Unknown')} - Properties: {kg_fact.get('properties', {})}",
+                    "document_id": kg_fact.get("document_id", "knowledge_graph"),
+                    "page_section": kg_fact.get("page_section", "knowledge_graph"),
+                    "retrieval_source": f"Knowledge Graph (KG) - {kg_fact.get('node_type', 'Entity')} entity"
+                })
+                citation_counter += 1
+            
+            # Enhance justification with citation references
+            original_justification = agent_result.get('reasoning', 'Agent analysis completed.')
+            citation_enhanced_justification = f"{original_justification} "
+            
+            # Add citation references to justification
+            if relevant_clauses:
+                source_list = [clause["retrieval_source"] for clause in relevant_clauses[:3]]
+                citation_enhanced_justification += f"[Sources: {', '.join(source_list)}]"
+            
+            return QueryResponse(
+                Decision=agent_result.get('decision', 'Requires Further Review'),
+                Amount=str(agent_result.get('amount', 'N/A')),
+                Justification=citation_enhanced_justification,
+                Relevant_Clauses=relevant_clauses,
+                Processing_Info={
+                    "processing_method": "multi_agent_with_citations",
+                    "agent_intent": agent_result.get('intent', 'unknown'),
+                    "vdb_chunks_used": len(vdb_results),
+                    "kg_facts_used": len(kg_facts),
+                    "total_citations": len(relevant_clauses),
+                    "confidence": agent_result.get('confidence', 'medium')
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in agent-based citation processing: {e}")
+            # Fallback to the original citation method
+            return self._process_with_citations(query, vdb_results, kg_facts)
     
     def _fallback_query_processing_simple(self, query: str, vdb_results: list) -> QueryResponse:
         """Simple fallback when citation processing fails"""
@@ -1039,15 +1275,34 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_uploaded_document(file_path: str, document_id: str):
-    """Background task for document processing"""
+    """Background task for document processing with enhanced error handling"""
+    import asyncio
+    
     try:
         logger.info(f"🔄 Background processing: {document_id}")
-        result = hybrid_processor.process_document(file_path, document_id)
         
-        if result.get("success"):
-            logger.info(f"✅ Document processed successfully: {document_id}")
-        else:
-            logger.error(f"❌ Document processing failed: {result.get('error')}")
+        # Add longer timeout for large documents
+        try:
+            # Run document processing with timeout
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    hybrid_processor.process_document, 
+                    file_path, 
+                    document_id
+                ),
+                timeout=300  # 5 minutes timeout for large documents
+            )
+            
+            if result.get("success"):
+                kg_status = "✅" if result.get("kg_processed") else "⚠️"
+                vdb_chunks = result.get("vdb_chunks", 0)
+                logger.info(f"✅ Document processed: {document_id} | KG: {kg_status} | VDB: {vdb_chunks} chunks")
+            else:
+                logger.error(f"❌ Document processing failed: {result.get('error')}")
+                
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Document processing timed out after 5 minutes: {document_id}")
             
     except Exception as e:
         logger.error(f"❌ Background processing error: {e}")
@@ -1088,8 +1343,52 @@ async def get_session_stats():
 async def get_status():
     """Get system status"""
     try:
-        kg_status = "healthy" if hybrid_processor.kg_manager else "unavailable"
-        vdb_status = "healthy" if hybrid_processor.vector_store else "unavailable"
+        # Enhanced KG status with connection mode
+        kg_status = {
+            "status": "unavailable",
+            "connection_mode": "unknown",
+            "details": "KG Manager not initialized"
+        }
+        
+        if hybrid_processor.kg_manager:
+            try:
+                kg_mode = hybrid_processor.kg_manager.connection_mode
+                session_stats = hybrid_processor.kg_manager.get_session_stats()
+                kg_status = {
+                    "status": "healthy",
+                    "connection_mode": kg_mode,
+                    "node_count": session_stats.get("documents_in_session", 0),
+                    "details": f"Neo4j KG operational in {kg_mode} mode"
+                }
+            except Exception as kg_error:
+                kg_status = {
+                    "status": "error",
+                    "connection_mode": "unknown", 
+                    "details": f"KG connection error: {str(kg_error)}"
+                }
+        
+        # Enhanced VDB status with collection info
+        vdb_status = {
+            "status": "unavailable",
+            "details": "ChromaDB not initialized"
+        }
+        
+        if hybrid_processor.vector_store:
+            try:
+                collection = hybrid_processor.vector_store._collection
+                doc_count = collection.count()
+                vdb_status = {
+                    "status": "healthy",
+                    "document_count": doc_count,
+                    "collection_name": "insurance_documents",
+                    "details": f"ChromaDB operational with {doc_count} documents"
+                }
+            except Exception as vdb_error:
+                vdb_status = {
+                    "status": "error", 
+                    "details": f"ChromaDB connection error: {str(vdb_error)}"
+                }
+        
         llm_status = "healthy" if hybrid_processor.llm else "unavailable"
         
         return {
@@ -1104,6 +1403,129 @@ async def get_status():
     except Exception as e:
         logger.error(f"❌ Status check error: {e}")
         return {"status": "error", "message": str(e)}
+
+@app.post("/admin/clear-vector-db")
+async def clear_vector_database():
+    """Clear all data from ChromaDB vector database"""
+    try:
+        if not hybrid_processor.vector_store:
+            return {"success": False, "message": "Vector database not available"}
+        
+        # Clear ChromaDB collection
+        collection = hybrid_processor.vector_store._collection
+        collection.delete()
+        
+        # Reinitialize ChromaDB
+        hybrid_processor._initialize_chromadb()
+        
+        logger.info("✅ Vector database cleared successfully")
+        return {
+            "success": True,
+            "message": "Vector database cleared successfully",
+            "action": "vector_db_cleared"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error clearing vector database: {e}")
+        return {
+            "success": False,
+            "message": f"Error clearing vector database: {str(e)}",
+            "error": str(e)
+        }
+
+@app.post("/admin/clear-knowledge-graph")
+async def clear_knowledge_graph():
+    """Clear all data from Neo4j knowledge graph"""
+    try:
+        if not hybrid_processor.kg_manager:
+            return {"success": False, "message": "Knowledge graph not available"}
+        
+        # Clear Neo4j data
+        success = hybrid_processor.kg_manager.clear_session()
+        
+        if success:
+            logger.info("✅ Knowledge graph cleared successfully")
+            return {
+                "success": True,
+                "message": "Knowledge graph cleared successfully",
+                "action": "knowledge_graph_cleared"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Failed to clear knowledge graph"
+            }
+        
+    except Exception as e:
+        logger.error(f"❌ Error clearing knowledge graph: {e}")
+        return {
+            "success": False,
+            "message": f"Error clearing knowledge graph: {str(e)}",
+            "error": str(e)
+        }
+
+@app.post("/admin/clear-all-data")
+async def clear_all_data():
+    """Clear all uploaded data from both vector database and knowledge graph"""
+    try:
+        results = {
+            "vector_db": {"success": False, "message": "Not attempted"},
+            "knowledge_graph": {"success": False, "message": "Not attempted"},
+            "uploaded_files": {"success": False, "message": "Not attempted"}
+        }
+        
+        # Clear vector database
+        if hybrid_processor.vector_store:
+            try:
+                collection = hybrid_processor.vector_store._collection
+                collection.delete()
+                hybrid_processor._initialize_chromadb()
+                results["vector_db"] = {"success": True, "message": "Vector database cleared"}
+            except Exception as vdb_error:
+                results["vector_db"] = {"success": False, "message": f"VDB error: {str(vdb_error)}"}
+        
+        # Clear knowledge graph
+        if hybrid_processor.kg_manager:
+            try:
+                kg_success = hybrid_processor.kg_manager.clear_session()
+                if kg_success:
+                    results["knowledge_graph"] = {"success": True, "message": "Knowledge graph cleared"}
+                else:
+                    results["knowledge_graph"] = {"success": False, "message": "KG clear operation failed"}
+            except Exception as kg_error:
+                results["knowledge_graph"] = {"success": False, "message": f"KG error: {str(kg_error)}"}
+        
+        # Clear uploaded files
+        try:
+            upload_dir = Path("documents/uploads")
+            if upload_dir.exists():
+                import shutil
+                shutil.rmtree(upload_dir)
+                upload_dir.mkdir(exist_ok=True)
+                results["uploaded_files"] = {"success": True, "message": "Uploaded files removed"}
+            else:
+                results["uploaded_files"] = {"success": True, "message": "No uploaded files to remove"}
+        except Exception as file_error:
+            results["uploaded_files"] = {"success": False, "message": f"File error: {str(file_error)}"}
+        
+        # Determine overall success
+        overall_success = all(result["success"] for result in results.values())
+        
+        logger.info("✅ Complete data clearing operation completed")
+        return {
+            "success": overall_success,
+            "message": "Data clearing operation completed",
+            "action": "all_data_cleared",
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error in clear all data operation: {e}")
+        return {
+            "success": False,
+            "message": f"Error in clear all data operation: {str(e)}",
+            "error": str(e)
+        }
 
 @app.get("/health")
 async def health_check():
