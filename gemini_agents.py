@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +19,9 @@ import google.generativeai as genai
 # Environment and utilities
 from dotenv import load_dotenv
 from loguru import logger
+
+# Rate limiting configuration
+from rate_limiting_config import RateLimitConfig
 
 # Load environment variables
 load_dotenv()
@@ -71,8 +75,13 @@ class GeminiAgent:
                 self.llm = None
     
     def _execute_with_retry(self, prompt: str, max_retries: int = None) -> str:
-        """Execute prompt with retry logic"""
+        """Execute prompt with retry logic and rate limiting"""
         max_retries = max_retries or self.config.max_retries
+        
+        # Apply rate limiting delay before making request
+        delay = RateLimitConfig.get_agent_delay(self.agent_name)
+        logger.info(f"{self.agent_name}: Applying rate limit delay of {delay}s")
+        time.sleep(delay)
         
         for attempt in range(max_retries):
             try:
@@ -87,9 +96,23 @@ class GeminiAgent:
                     raise Exception("Empty response from Gemini")
                     
             except Exception as e:
-                logger.warning(f"{self.agent_name}: Attempt {attempt + 1} failed: {str(e)}")
+                error_str = str(e)
+                logger.warning(f"{self.agent_name}: Attempt {attempt + 1} failed: {error_str}")
+                
+                # Check for daily quota exceeded - don't retry if quota is exhausted
+                if "quota" in error_str.lower() and "day" in error_str.lower():
+                    logger.error(f"{self.agent_name}: Daily quota exceeded - stopping retries")
+                    raise e
+                
+                # Check for rate limit errors and apply longer delay
+                if "429" in error_str or "quota" in error_str.lower() or "rate limit" in error_str.lower():
+                    if attempt < max_retries - 1:  # Don't delay on last attempt
+                        retry_delay = delay * (attempt + 2)  # Exponential backoff
+                        logger.warning(f"{self.agent_name}: Rate limit hit, waiting {retry_delay}s before retry")
+                        time.sleep(retry_delay)
+                
                 if attempt == max_retries - 1:
-                    logger.error(f"{self.agent_name}: All attempts failed")
+                    logger.error(f"{self.agent_name}: All attempts failed with final error: {str(e)}")
                     raise e
         
         return ""
@@ -531,7 +554,7 @@ class GeminiAgentSystem:
         logger.info("Gemini Agent System initialized")
     
     def process_query(self, query: str, context_data: List = None) -> Dict[str, Any]:
-        """Process query through complete multi-agent pipeline"""
+        """Process query through complete multi-agent pipeline with rate limiting"""
         context_data = context_data or []
         
         logger.info(f"Starting Gemini multi-agent processing for query: {query[:100]}...")
@@ -540,20 +563,35 @@ class GeminiAgentSystem:
             # Step 1: Parse query
             logger.info("Step 1: Query Parsing")  
             parsed_query = self.query_parser.parse_query(query)
+            logger.info(f"Query parsing result: {parsed_query}")
+            
+            # Inter-agent delay
+            inter_delay = RateLimitConfig.INTER_AGENT_DELAY
+            logger.info(f"Inter-agent delay: {inter_delay}s")
+            time.sleep(inter_delay)
             
             # Step 2: Policy reasoning
             logger.info("Step 2: Policy Reasoning")
             reasoning_result = self.policy_reasoner.reason_about_policy(parsed_query, context_data)
+            logger.info(f"Policy reasoning result: {reasoning_result}")
+            
+            # Inter-agent delay
+            time.sleep(inter_delay)
             
             # Step 3: Financial calculation
             logger.info("Step 3: Financial Calculation")
             calculation_result = self.financial_calculator.calculate_amount(parsed_query, reasoning_result)
+            logger.info(f"Financial calculation result: {calculation_result}")
+            
+            # Inter-agent delay
+            time.sleep(inter_delay)
             
             # Step 4: Decision synthesis
             logger.info("Step 4: Decision Synthesis")
             final_decision = self.decision_synthesizer.synthesize_decision(
                 parsed_query, reasoning_result, calculation_result, context_data
             )
+            logger.info(f"Final decision result: {final_decision}")
             
             # Add processing metadata
             final_decision["Processing_Info"] = {

@@ -8,19 +8,20 @@ import os
 class RateLimitConfig:
     """Configuration for rate limiting across the system"""
     
-    # Base delays for different components (in seconds) - Increased for rate limiting
-    QUERY_PARSING_AGENT_DELAY = float(os.getenv("QUERY_PARSING_DELAY", "8.0"))
-    GRAPH_QUERY_GEN_DELAY = float(os.getenv("GRAPH_QUERY_GEN_DELAY", "10.0"))
-    KG_ANALYSIS_DELAY = float(os.getenv("KG_ANALYSIS_DELAY", "12.0"))
-    POLICY_REASONING_DELAY = float(os.getenv("POLICY_REASONING_DELAY", "14.0"))
-    FINANCIAL_CALC_DELAY = float(os.getenv("FINANCIAL_CALC_DELAY", "16.0"))
-    DECISION_SYNTHESIS_DELAY = float(os.getenv("DECISION_SYNTHESIS_DELAY", "18.0"))
+    # Base delays for different components (in seconds) - Optimized for 25 requests/minute
+    # 25 requests/minute = 1 request every 2.4 seconds minimum
+    QUERY_PARSING_AGENT_DELAY = float(os.getenv("QUERY_PARSING_DELAY", "3.0"))
+    GRAPH_QUERY_GEN_DELAY = float(os.getenv("GRAPH_QUERY_GEN_DELAY", "3.0"))
+    KG_ANALYSIS_DELAY = float(os.getenv("KG_ANALYSIS_DELAY", "3.0"))
+    POLICY_REASONING_DELAY = float(os.getenv("POLICY_REASONING_DELAY", "3.0"))
+    FINANCIAL_CALC_DELAY = float(os.getenv("FINANCIAL_CALC_DELAY", "3.0"))
+    DECISION_SYNTHESIS_DELAY = float(os.getenv("DECISION_SYNTHESIS_DELAY", "3.0"))
     
     # Document processor delay (longer since it processes large documents)
-    DOCUMENT_PROCESSOR_DELAY = float(os.getenv("DOCUMENT_PROCESSOR_DELAY", "15.0"))
+    DOCUMENT_PROCESSOR_DELAY = float(os.getenv("DOCUMENT_PROCESSOR_DELAY", "5.0"))
     
     # Inter-agent delay (delay between different agents in orchestrator)
-    INTER_AGENT_DELAY = float(os.getenv("INTER_AGENT_DELAY", "5.0"))
+    INTER_AGENT_DELAY = float(os.getenv("INTER_AGENT_DELAY", "1.0"))
     
     # Retry configuration
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
